@@ -1,0 +1,23 @@
+#ifndef COMMANDS_H
+#define COMMANDS_H
+
+#include "user.h"
+
+int command_login(int fd, const struct sockaddr_in *server,
+                  UserState *user, const char *uid,
+                  const char *password, int peer_port);
+int command_logout(int fd, const struct sockaddr_in *server, UserState *user);
+int command_unregister(int fd, const struct sockaddr_in *server, UserState *user);
+int command_publish(int fd, const struct sockaddr_in *server, UserState *user,
+                    const char *filename, const char *label);
+int command_remove(int fd, const struct sockaddr_in *server, UserState *user,
+                   const char *filename);
+int command_list(int fd, const struct sockaddr_in *server);
+int command_versions(const struct sockaddr_in *server, int ds_port,
+                     const char *filename);
+int command_where(const struct sockaddr_in *server, int ds_port,
+                  const char *filename);
+int command_get(const char *filename, const char *peer_ip, const char *peer_port,
+                const char *destination);
+
+#endif
