@@ -31,7 +31,7 @@ void print_help()
               << "  list\n"
               << "  versions filename\n"
               << "  where filename\n"
-              << "  get filename peerIPv4 peerPort [destination]\n"
+              << "  get filename\n"
               << "  logout | unregister | help | exit\n"
               << "Files are read from and saved to the current directory.\n";
 }
@@ -46,6 +46,12 @@ void run_user_interface(int udp_fd, const struct sockaddr_in &server,
         std::cout << "> " << std::flush;
         if (!std::getline(std::cin, line)) {
             std::cout << '\n';
+            if (user.logged_in) {
+                std::cout << "Input closed; attempting to log out the active user.\n";
+                command_logout(udp_fd, &server, &user);
+                if (user.logged_in)
+                    std::cerr << "Logout could not be confirmed; the Directory Server may still consider this user active.\n";
+            }
             return;
         }
         if (line.size() > MAX_LINE - 1) {
@@ -114,13 +120,11 @@ void run_user_interface(int udp_fd, const struct sockaddr_in &server,
             else
                 command_where(&server, ntohs(server.sin_port), fields[1].c_str());
         } else if (command == "get") {
-            if (fields.size() != 4 && fields.size() != 5) {
-                std::cout << "Usage: get filename peerIPv4 peerPort [destination]\n";
-            } else {
-                const char *destination = fields.size() == 5 ? fields[4].c_str() : nullptr;
-                command_get(fields[1].c_str(), fields[2].c_str(),
-                            fields[3].c_str(), destination);
-            }
+            if (fields.size() != 2)
+                std::cout << "Usage: get filename\n";
+            else
+                command_get(udp_fd, &server, ntohs(server.sin_port),
+                            fields[1].c_str());
         } else if (command == "exit") {
             if (fields.size() != 1) {
                 std::cout << "Usage: exit\n";

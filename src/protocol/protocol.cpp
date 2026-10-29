@@ -1,12 +1,15 @@
 #include "protocol.h"
 
 #include <errno.h>
+#include <chrono>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 int valid_port(const char *text, int *port)
 {
@@ -121,27 +124,68 @@ int send_request(int fd, const struct sockaddr_in *server,
         return -1;
     }
 
-    struct sockaddr_in from;
-    socklen_t from_length = sizeof(from);
-    const ssize_t received = recvfrom(fd, reply, reply_size - 1, 0,
-                                     reinterpret_cast<struct sockaddr *>(&from),
-                                     &from_length);
-    if (received < 0) {
-        perror("recvfrom");
-        return -1;
-    }
-    if (from.sin_family != AF_INET || from.sin_addr.s_addr != server->sin_addr.s_addr ||
-        from.sin_port != server->sin_port) {
-        fprintf(stderr, "Ignored a UDP reply from an unexpected source.\n");
-        return -1;
-    }
+    constexpr int UDP_REPLY_TIMEOUT_MS = 10000;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(UDP_REPLY_TIMEOUT_MS);
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            fprintf(stderr, "Timed out waiting for a UDP reply from Directory Server.\n");
+            return -1;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        struct pollfd descriptor = {fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, static_cast<int>(remaining.count()) + 1);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0) {
+            perror("poll for Directory Server UDP reply");
+            return -1;
+        }
+        if (ready == 0)
+            continue;
+        if (descriptor.revents & (POLLERR | POLLNVAL)) {
+            fprintf(stderr, "UDP socket failed while waiting for Directory Server.\n");
+            return -1;
+        }
+        if (!(descriptor.revents & POLLIN))
+            continue;
 
-    reply[received] = '\0';
-    if (received == 0 || reply[received - 1] != '\n') {
-        fprintf(stderr, "Directory Server UDP reply is missing its newline terminator.\n");
-        return -1;
+        struct sockaddr_in from;
+        struct iovec payload = {reply, reply_size - 1};
+        struct msghdr message;
+        memset(&message, 0, sizeof(message));
+        message.msg_name = &from;
+        message.msg_namelen = sizeof(from);
+        message.msg_iov = &payload;
+        message.msg_iovlen = 1;
+        const ssize_t received = recvmsg(fd, &message, MSG_DONTWAIT);
+        if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (received < 0) {
+            perror("recvfrom");
+            return -1;
+        }
+        if (from.sin_family != AF_INET ||
+            from.sin_addr.s_addr != server->sin_addr.s_addr ||
+            from.sin_port != server->sin_port)
+            continue;
+        if ((message.msg_flags & MSG_TRUNC) != 0 ||
+            static_cast<size_t>(received) >= reply_size) {
+            fprintf(stderr, "Directory Server UDP reply is too large.\n");
+            return -1;
+        }
+
+        reply[received] = '\0';
+        if (received == 0 || reply[received - 1] != '\n' ||
+            memchr(reply, '\0', static_cast<size_t>(received)) != nullptr ||
+            memchr(reply, '\n', static_cast<size_t>(received)) != reply + received - 1) {
+            fprintf(stderr, "Directory Server UDP reply is not a single text line.\n");
+            return -1;
+        }
+        return 0;
     }
-    return 0;
 }
 
 int parse_reply(const char *reply, const char *expected_prefix,
@@ -153,18 +197,29 @@ int parse_reply(const char *reply, const char *expected_prefix,
         return -1;
     }
 
-    std::istringstream input(reply);
-    std::string prefix;
-    std::string value;
-    if (!(input >> prefix >> value) || prefix != expected_prefix) {
+    const char *separator = strchr(reply, ' ');
+    const char *newline = strchr(reply, '\n');
+    if (separator == nullptr || newline == nullptr || newline[1] != '\0' ||
+        separator == reply || separator >= newline || strchr(separator + 1, ' ') != nullptr ||
+        static_cast<size_t>(separator - reply) != strlen(expected_prefix) ||
+        strncmp(reply, expected_prefix, strlen(expected_prefix)) != 0 ||
+        separator + 1 == newline) {
         fprintf(stderr, "Unexpected Directory Server reply: %s", reply);
         return -1;
     }
-    if (value.size() >= status_size) {
+    const size_t value_size = static_cast<size_t>(newline - separator - 1);
+    if (value_size >= status_size) {
         fprintf(stderr, "Directory Server status is too long.\n");
         return -1;
     }
-    memcpy(status, value.c_str(), value.size() + 1);
+    for (const char *cursor = separator + 1; cursor < newline; ++cursor) {
+        if (*cursor < 'A' || *cursor > 'Z') {
+            fprintf(stderr, "Directory Server returned an invalid status token.\n");
+            return -1;
+        }
+    }
+    memcpy(status, separator + 1, value_size);
+    status[value_size] = '\0';
     return 0;
 }
 

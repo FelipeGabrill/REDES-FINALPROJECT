@@ -1,8 +1,10 @@
 #include "peer.h"
 
 #include "protocol.h"
+#include "network.h"
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <errno.h>
 #include <exception>
 #include <fcntl.h>
@@ -10,12 +12,18 @@
 #include <sstream>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
+
+constexpr size_t MAX_CLIENT_WORKERS = 16;
+constexpr int TCP_CONTROL_DEADLINE_MS = 30000;
+
+using PeerDeadline = std::chrono::steady_clock::time_point;
 
 int write_all(int fd, const char *data, size_t length)
 {
@@ -31,13 +39,91 @@ int write_all(int fd, const char *data, size_t length)
     return 0;
 }
 
-bool read_line(int fd, std::string &line, size_t max_length)
+int remaining_ms(const PeerDeadline &deadline)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        errno = ETIMEDOUT;
+        return 0;
+    }
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+    return static_cast<int>(remaining.count());
+}
+
+int wait_for_socket(int fd, short events, const PeerDeadline &deadline)
+{
+    while (true) {
+        const int timeout_ms = remaining_ms(deadline);
+        if (timeout_ms == 0)
+            return -1;
+
+        struct pollfd descriptor = {fd, events, 0};
+        const int ready = poll(&descriptor, 1, timeout_ms);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0)
+            return -1;
+        if (ready == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (descriptor.revents & POLLNVAL) {
+            errno = EBADF;
+            return -1;
+        }
+        return 0;
+    }
+}
+
+int prevent_sigpipe(int fd)
+{
+#ifdef SO_NOSIGPIPE
+    const int enabled = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
+int peer_send_flags(void)
+{
+    int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    return flags;
+}
+
+int write_all_until(int fd, const char *data, size_t length,
+                    const PeerDeadline &deadline)
+{
+    size_t offset = 0;
+    while (offset < length) {
+        if (wait_for_socket(fd, POLLOUT, deadline) < 0)
+            return -1;
+        const ssize_t written = send(fd, data + offset, length - offset,
+                                     peer_send_flags());
+        if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (written <= 0)
+            return -1;
+        offset += static_cast<size_t>(written);
+    }
+    return 0;
+}
+
+bool read_line_until(int fd, std::string &line, size_t max_length,
+                     const PeerDeadline &deadline)
 {
     line.clear();
     while (line.size() < max_length) {
         char byte = '\0';
-        const ssize_t received = read(fd, &byte, 1);
-        if (received < 0 && errno == EINTR)
+        if (wait_for_socket(fd, POLLIN, deadline) < 0)
+            return false;
+        const ssize_t received = recv(fd, &byte, 1, MSG_DONTWAIT);
+        if (received < 0 &&
+            (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
         if (received <= 0)
             return false;
@@ -49,20 +135,26 @@ bool read_line(int fd, std::string &line, size_t max_length)
     return false;
 }
 
-void send_peer_error(int fd)
+void send_peer_status(int fd, const char *status)
 {
-    static const char response[] = "ERR\n";
-    write_all(fd, response, sizeof(response) - 1);
+    char response[32];
+    const int length = snprintf(response, sizeof(response), "RGT %s\n", status);
+    if (length > 0 && static_cast<size_t>(length) < sizeof(response))
+        write_all(fd, response, static_cast<size_t>(length));
 }
 
 void serve_connection(int fd)
 {
-    const struct timeval timeout = {5, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (set_tcp_io_timeouts(fd, 30) < 0)
+        return;
+    if (prevent_sigpipe(fd) < 0)
+        return;
+    const PeerDeadline deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(TCP_CONTROL_DEADLINE_MS);
 
     std::string request;
-    if (!read_line(fd, request, 128)) {
-        send_peer_error(fd);
+    if (!read_line_until(fd, request, 128, deadline)) {
+        send_peer_status(fd, "ERR");
         return;
     }
 
@@ -72,13 +164,13 @@ void serve_connection(int fd)
     std::string extra;
     if (!(input >> operation >> filename) || (input >> extra) ||
         operation != "GET" || !valid_filename(filename.c_str())) {
-        send_peer_error(fd);
+        send_peer_status(fd, "ERR");
         return;
     }
 
     const int file_fd = open(filename.c_str(), O_RDONLY);
     if (file_fd < 0) {
-        send_peer_error(fd);
+        send_peer_status(fd, "NOK");
         return;
     }
 
@@ -86,15 +178,15 @@ void serve_connection(int fd)
     if (fstat(file_fd, &info) < 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
         info.st_size > MAX_FILE_SIZE) {
         close(file_fd);
-        send_peer_error(fd);
+        send_peer_status(fd, "NOK");
         return;
     }
 
     char header[64];
-    const int header_length = snprintf(header, sizeof(header), "OK %lld\n",
+    const int header_length = snprintf(header, sizeof(header), "RGT OK %lld\n",
                                        static_cast<long long>(info.st_size));
     if (header_length < 0 || static_cast<size_t>(header_length) >= sizeof(header) ||
-        write_all(fd, header, static_cast<size_t>(header_length)) < 0) {
+        write_all_until(fd, header, static_cast<size_t>(header_length), deadline) < 0) {
         close(file_fd);
         return;
     }
@@ -131,8 +223,13 @@ bool connect_ipv4(const std::string &ip, int port, int &fd, std::string &error)
         error = std::string("Could not create TCP socket: ") + strerror(errno);
         return false;
     }
-    if (connect(fd, reinterpret_cast<const struct sockaddr *>(&address),
-                sizeof(address)) < 0) {
+    if (prevent_sigpipe(fd) < 0) {
+        error = std::string("Could not configure peer TCP socket: ") + strerror(errno);
+        close(fd);
+        fd = -1;
+        return false;
+    }
+    if (connect_tcp_with_timeout(fd, &address, 10000) < 0) {
         error = std::string("Could not connect to peer: ") + strerror(errno);
         close(fd);
         fd = -1;
@@ -192,6 +289,7 @@ bool PeerServer::start(int port, std::string &error)
 
     running_.store(true);
     try {
+        client_workers_.reserve(MAX_CLIENT_WORKERS);
         worker_ = std::thread(&PeerServer::serve, this);
     } catch (const std::exception &exception) {
         running_.store(false);
@@ -219,6 +317,16 @@ void PeerServer::stop()
 void PeerServer::serve()
 {
     while (running_.load()) {
+        for (auto it = client_workers_.begin(); it != client_workers_.end();) {
+            if (it->done->load()) {
+                if (it->thread.joinable())
+                    it->thread.join();
+                it = client_workers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         fd_set readable;
         FD_ZERO(&readable);
         FD_SET(listen_fd_, &readable);
@@ -242,14 +350,48 @@ void PeerServer::serve()
                 break;
             continue;
         }
-        serve_connection(client_fd);
-        close(client_fd);
+        if (client_workers_.size() >= MAX_CLIENT_WORKERS) {
+            send_peer_status(client_fd, "NOK");
+            close(client_fd);
+            continue;
+        }
+
+        std::shared_ptr<std::atomic<bool>> done;
+        try {
+            done = std::make_shared<std::atomic<bool>>(false);
+        } catch (const std::exception &) {
+            send_peer_status(client_fd, "NOK");
+            close(client_fd);
+            continue;
+        }
+
+        ClientWorker client;
+        client.done = done;
+        try {
+            client.thread = std::thread([client_fd, done]() {
+                serve_connection(client_fd);
+                close(client_fd);
+                done->store(true);
+            });
+        } catch (const std::exception &) {
+            send_peer_status(client_fd, "NOK");
+            close(client_fd);
+            continue;
+        }
+        client_workers_.push_back(std::move(client));
     }
+
+    for (ClientWorker &client : client_workers_) {
+        if (client.thread.joinable())
+            client.thread.join();
+    }
+    client_workers_.clear();
 }
 
 int download_peer_file(const std::string &peer_ip, int peer_port,
                        const std::string &filename,
                        const std::string &destination,
+                       unsigned long long *received_size,
                        std::string &error)
 {
     if (!valid_filename(filename.c_str())) {
@@ -265,50 +407,64 @@ int download_peer_file(const std::string &peer_ip, int peer_port,
         return -1;
     }
 
-    const int output_fd = open(destination.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (output_fd < 0) {
-        error = std::string("Cannot create destination file ") + destination +
-                ": " + strerror(errno);
-        return -1;
-    }
-
     int socket_fd = -1;
-    if (!connect_ipv4(peer_ip, peer_port, socket_fd, error)) {
-        close(output_fd);
-        unlink(destination.c_str());
+    if (!connect_ipv4(peer_ip, peer_port, socket_fd, error))
+        return -1;
+
+    if (set_tcp_io_timeouts(socket_fd, 30) < 0) {
+        error = std::string("Could not configure peer socket timeout: ") + strerror(errno);
+        close(socket_fd);
         return -1;
     }
 
     const std::string request = "GET " + filename + "\n";
-    if (write_all(socket_fd, request.data(), request.size()) < 0) {
+    const PeerDeadline deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(TCP_CONTROL_DEADLINE_MS);
+    if (write_all_until(socket_fd, request.data(), request.size(), deadline) < 0) {
         error = std::string("Could not send download request: ") + strerror(errno);
         close(socket_fd);
-        close(output_fd);
-        unlink(destination.c_str());
         return -1;
     }
     shutdown(socket_fd, SHUT_WR);
 
     std::string response;
-    if (!read_line(socket_fd, response, 128)) {
+    if (!read_line_until(socket_fd, response, 128, deadline)) {
         error = "Peer sent an incomplete response.";
         close(socket_fd);
-        close(output_fd);
-        unlink(destination.c_str());
         return -1;
     }
 
     std::istringstream header(response);
+    std::string prefix;
     std::string status;
     long long file_size = -1;
     std::string extra;
-    if (!(header >> status) || status != "OK" || !(header >> file_size) ||
-        (header >> extra) || file_size < 0 || file_size > MAX_FILE_SIZE) {
-        error = status == "ERR" ? "Peer does not have that file." :
-                "Peer sent an invalid file header.";
+    if (!(header >> prefix >> status) || prefix != "RGT") {
+        error = "Peer sent an invalid file header.";
         close(socket_fd);
-        close(output_fd);
-        unlink(destination.c_str());
+        return -1;
+    }
+    if (status != "OK") {
+        error = status == "NOK" ? "Peer does not have that file." :
+                status == "ERR" ? "Peer rejected the request." :
+                "Peer sent an invalid transfer status.";
+        if (header >> extra)
+            error = "Peer sent an invalid error response.";
+        close(socket_fd);
+        return -1;
+    }
+    if (!(header >> file_size) || (header >> extra) || file_size < 0 ||
+        file_size > MAX_FILE_SIZE) {
+        error = "Peer sent an invalid file size.";
+        close(socket_fd);
+        return -1;
+    }
+
+    const int output_fd = open(destination.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (output_fd < 0) {
+        error = std::string("Cannot create destination file ") + destination +
+                ": " + strerror(errno);
+        close(socket_fd);
         return -1;
     }
 
@@ -344,5 +500,7 @@ int download_peer_file(const std::string &peer_ip, int peer_port,
         unlink(destination.c_str());
         return -1;
     }
+    if (received_size != nullptr)
+        *received_size = static_cast<unsigned long long>(file_size);
     return 0;
 }

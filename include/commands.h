@@ -3,6 +3,14 @@
 
 #include "user.h"
 
+#include <string>
+
+struct PeerEndpoint {
+    std::string uid;
+    std::string ip;
+    int port;
+};
+
 int command_login(int fd, const struct sockaddr_in *server,
                   UserState *user, const char *uid,
                   const char *password, int peer_port);
@@ -17,7 +25,7 @@ int command_versions(const struct sockaddr_in *server, int ds_port,
                      const char *filename);
 int command_where(const struct sockaddr_in *server, int ds_port,
                   const char *filename);
-int command_get(const char *filename, const char *peer_ip, const char *peer_port,
-                const char *destination);
+int command_get(int udp_fd, const struct sockaddr_in *server, int ds_port,
+                const char *filename);
 
 #endif

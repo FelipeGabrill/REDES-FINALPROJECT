@@ -3,13 +3,16 @@
 #include "network.h"
 #include "peer.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <initializer_list>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -32,9 +35,29 @@ void report_resource_status(const char *operation, const char *status)
         printf("%s failed: status %s.\n", operation, status);
 }
 
+bool status_is_allowed(const char *status,
+                       std::initializer_list<const char *> allowed_statuses)
+{
+    for (const char *allowed : allowed_statuses) {
+        if (strcmp(status, allowed) == 0)
+            return true;
+    }
+    return false;
+}
+
+void clear_user_session(UserState *user)
+{
+    if (user == nullptr)
+        return;
+    memset(user->uid, 0, sizeof(user->uid));
+    memset(user->password, 0, sizeof(user->password));
+    user->logged_in = 0;
+}
+
 int udp_resource_request(int fd, const struct sockaddr_in *server,
                          const char *request, const char *prefix,
-                         const char *operation)
+                         const char *operation,
+                         std::initializer_list<const char *> allowed_statuses)
 {
     char reply[MAX_MESSAGE];
     char status[16];
@@ -42,6 +65,11 @@ int udp_resource_request(int fd, const struct sockaddr_in *server,
         return -1;
     if (parse_reply(reply, prefix, status, sizeof(status)) < 0)
         return -1;
+    if (!status_is_allowed(status, allowed_statuses)) {
+        fprintf(stderr, "Unexpected %s status from Directory Server: %s.\n",
+                prefix, status);
+        return -1;
+    }
     report_resource_status(operation, status);
     return 0;
 }
@@ -59,6 +87,175 @@ bool parse_file_size(const std::string &text, unsigned long long &value)
             return false;
     }
     return true;
+}
+
+bool split_protocol_line(const char *line, std::vector<std::string> &tokens)
+{
+    tokens.clear();
+    if (line == nullptr)
+        return false;
+
+    const std::string message(line);
+    if (message.size() < 2 || message.back() != '\n' ||
+        message.find('\n') != message.size() - 1)
+        return false;
+
+    const size_t content_length = message.size() - 1;
+    size_t start = 0;
+    for (size_t i = 0; i <= content_length; ++i) {
+        if (i < content_length &&
+            static_cast<unsigned char>(message[i]) < static_cast<unsigned char>(' ') &&
+            message[i] != '\n')
+            return false;
+        if (i != content_length && message[i] != ' ')
+            continue;
+        if (i == start)
+            return false;
+        tokens.emplace_back(message, start, i - start);
+        start = i + 1;
+    }
+    return true;
+}
+
+struct Version {
+    std::string uid;
+    std::string size;
+    std::string label;
+    std::string publication_time;
+    std::string availability;
+};
+
+enum class VersionsResult { Ok, Empty, Error };
+
+VersionsResult fetch_versions(const struct sockaddr_in *server, int ds_port,
+                              const char *filename,
+                              std::vector<Version> &versions)
+{
+    char request[64];
+    char reply[MAX_MESSAGE];
+    snprintf(request, sizeof(request), "VRS %s\n", filename);
+    if (tcp_exchange(server, ds_port, request, reply, sizeof(reply)) < 0)
+        return VersionsResult::Error;
+
+    std::vector<std::string> fields;
+    if (!split_protocol_line(reply, fields) || fields.size() < 2 ||
+        fields[0] != "RVR") {
+        fprintf(stderr, "Invalid versions reply from Directory Server.\n");
+        return VersionsResult::Error;
+    }
+    const std::string &status = fields[1];
+    if (status == "NOK") {
+        if (fields.size() != 2) {
+            fprintf(stderr, "Unexpected fields in empty versions reply.\n");
+            return VersionsResult::Error;
+        }
+        return VersionsResult::Empty;
+    }
+    if (status != "OK") {
+        fprintf(stderr, "Versions request failed: status %s.\n", status.c_str());
+        return VersionsResult::Error;
+    }
+
+    if (fields.size() == 2) {
+        fprintf(stderr,
+                "Inconsistent versions reply: RVR OK contains no versions.\n");
+        return VersionsResult::Error;
+    }
+    if ((fields.size() - 2) % 5 != 0) {
+        fprintf(stderr, "Incomplete version entry from Directory Server.\n");
+        return VersionsResult::Error;
+    }
+
+    std::set<std::string> unique_uids;
+    for (size_t i = 2; i < fields.size(); i += 5) {
+        Version version{fields[i], fields[i + 1], fields[i + 2], fields[i + 3],
+                        fields[i + 4]};
+        unsigned long long size = 0;
+        if (!valid_uid(version.uid.c_str()) || !parse_file_size(version.size, size) ||
+            !valid_label(version.label.c_str()) ||
+            (version.availability != "AVL" && version.availability != "NAV") ||
+            !unique_uids.insert(version.uid).second) {
+            fprintf(stderr, "Invalid version entry from Directory Server.\n");
+            return VersionsResult::Error;
+        }
+        versions.push_back(version);
+    }
+    return VersionsResult::Ok;
+}
+
+int query_location(int fd, const struct sockaddr_in *server,
+                   const std::string &filename, const Version &version,
+                   std::vector<PeerEndpoint> &locations)
+{
+    char request[64];
+    char reply[MAX_MESSAGE];
+    snprintf(request, sizeof(request), "WHR %s %s\n",
+             filename.c_str(), version.uid.c_str());
+    if (send_request(fd, server, request, reply, sizeof(reply)) < 0)
+        return -1;
+
+    std::istringstream input(reply);
+    std::string prefix;
+    std::string status;
+    if (!(input >> prefix >> status) || prefix != "RWH") {
+        fprintf(stderr, "Invalid location reply from Directory Server.\n");
+        return -1;
+    }
+    if (status == "NOK") {
+        std::string extra;
+        if (input >> extra) {
+            fprintf(stderr, "Unexpected fields in unavailable location reply.\n");
+            return -1;
+        }
+        return 0;
+    }
+    if (status != "OK") {
+        fprintf(stderr, "Location request failed: status %s.\n", status.c_str());
+        return -1;
+    }
+
+    std::vector<PeerEndpoint> found;
+    std::string ip;
+    std::string port_text;
+    while (input >> ip) {
+        int port = 0;
+        struct in_addr address;
+        if (!(input >> port_text) || inet_pton(AF_INET, ip.c_str(), &address) != 1 ||
+            !valid_port(port_text.c_str(), &port)) {
+            fprintf(stderr, "Invalid peer endpoint in Directory Server reply.\n");
+            return -1;
+        }
+        found.push_back({version.uid, ip, port});
+    }
+    if (found.empty()) {
+        fprintf(stderr, "Directory Server returned RWH OK without a peer endpoint.\n");
+        return -1;
+    }
+    locations.insert(locations.end(), found.begin(), found.end());
+    return static_cast<int>(found.size());
+}
+
+int find_locations(int fd, const struct sockaddr_in *server,
+                   const std::string &filename,
+                   const std::vector<Version> &versions,
+                   std::vector<PeerEndpoint> &locations)
+{
+    std::set<std::string> unique_endpoints;
+    for (const Version &version : versions) {
+        if (version.availability != "AVL")
+            continue;
+        std::vector<PeerEndpoint> found;
+        const int result = query_location(fd, server, filename, version, found);
+        if (result < 0)
+            return -1;
+        for (const PeerEndpoint &endpoint : found) {
+            const std::string key = endpoint.uid + " " + endpoint.ip + " " +
+                                    std::to_string(endpoint.port);
+            if (unique_endpoints.insert(key).second)
+                locations.push_back(endpoint);
+        }
+    }
+    return static_cast<int>(locations.size());
 }
 
 } 
@@ -87,6 +284,10 @@ int command_login(int fd, const struct sockaddr_in *server,
     if (send_request(fd, server, request, reply, sizeof(reply)) < 0 ||
         parse_reply(reply, "RLI", status, sizeof(status)) < 0)
         return -1;
+    if (!status_is_allowed(status, {"OK", "NOK", "REG", "ERR"})) {
+        fprintf(stderr, "Unexpected RLI status from Directory Server: %s.\n", status);
+        return -1;
+    }
 
     print_login_result(status);
     if (strcmp(status, "OK") == 0 || strcmp(status, "REG") == 0) {
@@ -111,10 +312,15 @@ int command_logout(int fd, const struct sockaddr_in *server, UserState *user)
     if (send_request(fd, server, request, reply, sizeof(reply)) < 0 ||
         parse_reply(reply, "RLO", status, sizeof(status)) < 0)
         return -1;
+    if (!status_is_allowed(status, {"OK", "NLG", "UNR", "WRP", "ERR"})) {
+        fprintf(stderr, "Unexpected RLO status from Directory Server: %s.\n", status);
+        return -1;
+    }
 
     print_logout_result(status);
-    if (strcmp(status, "OK") == 0)
-        user->logged_in = 0;
+    if (strcmp(status, "OK") == 0 || strcmp(status, "NLG") == 0 ||
+        strcmp(status, "UNR") == 0)
+        clear_user_session(user);
     return 0;
 }
 
@@ -132,10 +338,15 @@ int command_unregister(int fd, const struct sockaddr_in *server, UserState *user
     if (send_request(fd, server, request, reply, sizeof(reply)) < 0 ||
         parse_reply(reply, "RUR", status, sizeof(status)) < 0)
         return -1;
+    if (!status_is_allowed(status, {"OK", "NOK", "UNR", "WRP", "ERR"})) {
+        fprintf(stderr, "Unexpected RUR status from Directory Server: %s.\n", status);
+        return -1;
+    }
 
     print_unregister_result(status);
-    if (strcmp(status, "OK") == 0)
-        user->logged_in = 0;
+    if (strcmp(status, "OK") == 0 || strcmp(status, "NOK") == 0 ||
+        strcmp(status, "UNR") == 0)
+        clear_user_session(user);
     return 0;
 }
 
@@ -169,7 +380,8 @@ int command_publish(int fd, const struct sockaddr_in *server, UserState *user,
     snprintf(request, sizeof(request), "PUB %s %s %s %lld %s\n",
              user->uid, user->password, filename,
              static_cast<long long>(info.st_size), label);
-    return udp_resource_request(fd, server, request, "RPB", "Publish");
+    return udp_resource_request(fd, server, request, "RPB", "Publish",
+                                {"OK", "NLG", "UNR", "WRP", "NOK", "ERR"});
 }
 
 int command_remove(int fd, const struct sockaddr_in *server, UserState *user,
@@ -187,7 +399,8 @@ int command_remove(int fd, const struct sockaddr_in *server, UserState *user,
     char request[MAX_MESSAGE];
     snprintf(request, sizeof(request), "REM %s %s %s\n",
              user->uid, user->password, filename);
-    return udp_resource_request(fd, server, request, "RRM", "Remove");
+    return udp_resource_request(fd, server, request, "RRM", "Remove",
+                                {"OK", "NLG", "UNR", "WRP", "NOK", "ERR"});
 }
 
 int command_list(int fd, const struct sockaddr_in *server)
@@ -196,45 +409,44 @@ int command_list(int fd, const struct sockaddr_in *server)
     if (send_request(fd, server, "LST\n", reply, sizeof(reply)) < 0)
         return -1;
 
-    std::istringstream input(reply);
-    std::string prefix;
-    std::string status;
-    if (!(input >> prefix >> status) || prefix != "RLS") {
+    std::vector<std::string> fields;
+    if (!split_protocol_line(reply, fields) || fields.size() < 2 ||
+        fields[0] != "RLS") {
         fprintf(stderr, "Invalid resource list reply from Directory Server.\n");
         return -1;
     }
+    const std::string &status = fields[1];
+    if (status != "OK" && status != "NOK") {
+        fprintf(stderr, "Unexpected RLS status from Directory Server: %s.\n",
+                status.c_str());
+        return -1;
+    }
     if (status == "NOK") {
-        std::string extra;
-        if (input >> extra) {
+        if (fields.size() != 2) {
             fprintf(stderr, "Unexpected fields in empty resource list reply.\n");
             return -1;
         }
         printf("No resources are currently known.\n");
         return 0;
     }
-    if (status != "OK") {
-        printf("List failed: status %s.\n", status.c_str());
-        return 0;
-    }
 
     std::vector<std::string> names;
     std::set<std::string> unique_names;
-    std::string name;
-    while (input >> name) {
+    if (fields.size() == 2 || fields.size() > 52) {
+        fprintf(stderr, "Directory Server returned an invalid filename count.\n");
+        return -1;
+    }
+    for (size_t i = 2; i < fields.size(); ++i) {
+        const std::string &name = fields[i];
         if (!valid_filename(name.c_str())) {
             fprintf(stderr, "Directory Server returned an invalid filename.\n");
             return -1;
         }
-        if (names.size() == 50) {
-            fprintf(stderr, "Directory Server returned more than 50 filenames.\n");
+        if (!unique_names.insert(name).second) {
+            fprintf(stderr, "Directory Server returned a duplicate filename.\n");
             return -1;
         }
-        if (unique_names.insert(name).second)
-            names.push_back(name);
-    }
-    if (names.empty()) {
-        printf("No resources are currently known.\n");
-        return 0;
+        names.push_back(name);
     }
 
     printf("Known resources (%zu):\n", names.size());
@@ -251,56 +463,13 @@ int command_versions(const struct sockaddr_in *server, int ds_port,
         return 0;
     }
 
-    char request[64];
-    char reply[MAX_MESSAGE];
-    snprintf(request, sizeof(request), "VRS %s\n", filename);
-    if (tcp_exchange(server, ds_port, request, reply, sizeof(reply)) < 0)
+    std::vector<Version> versions;
+    const VersionsResult result = fetch_versions(server, ds_port, filename, versions);
+    if (result == VersionsResult::Error)
         return -1;
-
-    std::istringstream input(reply);
-    std::string prefix;
-    std::string status;
-    if (!(input >> prefix >> status) || prefix != "RVR") {
-        fprintf(stderr, "Invalid versions reply from Directory Server.\n");
-        return -1;
-    }
-    if (status == "NOK") {
-        std::string extra;
-        if (input >> extra) {
-            fprintf(stderr, "Unexpected fields in empty versions reply.\n");
-            return -1;
-        }
+    if (result == VersionsResult::Empty) {
         printf("No available versions for %s.\n", filename);
         return 0;
-    }
-    if (status != "OK") {
-        printf("Versions request failed: status %s.\n", status.c_str());
-        return 0;
-    }
-
-    struct Version {
-        std::string uid;
-        std::string size;
-        std::string label;
-        std::string publication_time;
-        std::string availability;
-    };
-    std::vector<Version> versions;
-    Version version;
-    while (input >> version.uid) {
-        if (!(input >> version.size >> version.label >> version.publication_time >>
-              version.availability)) {
-            fprintf(stderr, "Incomplete version entry from Directory Server.\n");
-            return -1;
-        }
-        unsigned long long size = 0;
-        if (!valid_uid(version.uid.c_str()) || !parse_file_size(version.size, size) ||
-            !valid_label(version.label.c_str()) ||
-            (version.availability != "AVL" && version.availability != "NAV")) {
-            fprintf(stderr, "Invalid version entry from Directory Server.\n");
-            return -1;
-        }
-        versions.push_back(version);
     }
 
     printf("Versions of %s:\n", filename);
@@ -320,32 +489,92 @@ int command_versions(const struct sockaddr_in *server, int ds_port,
 int command_where(const struct sockaddr_in *server, int ds_port,
                   const char *filename)
 {
-    const int result = command_versions(server, ds_port, filename);
-    if (result == 0) {
-        printf("Phase II location lookup is incomplete: the specified RVR fields do not include a peer IP address or TCP port.\n");
+    if (!valid_filename(filename)) {
+        printf("Invalid filename.\n");
+        return 0;
     }
-    return result;
+
+    std::vector<Version> versions;
+    const VersionsResult result = fetch_versions(server, ds_port, filename, versions);
+    if (result == VersionsResult::Error)
+        return -1;
+    if (result == VersionsResult::Empty || versions.empty()) {
+        printf("No available peers for %s.\n", filename);
+        return 0;
+    }
+
+    const int fd = create_udp_socket();
+    if (fd < 0)
+        return -1;
+    std::vector<PeerEndpoint> locations;
+    const int lookup_result = find_locations(fd, server, filename, versions, locations);
+    close(fd);
+    if (lookup_result < 0)
+        return -1;
+
+    if (locations.empty()) {
+        printf("No peer is currently online and publishing %s.\n", filename);
+        return 0;
+    }
+    printf("Available peers for %s:\n", filename);
+    for (const PeerEndpoint &endpoint : locations)
+        printf("  UID %s | %s:%d\n", endpoint.uid.c_str(), endpoint.ip.c_str(),
+               endpoint.port);
+    return 0;
 }
 
-int command_get(const char *filename, const char *peer_ip, const char *peer_port_text,
-                const char *destination)
+int command_get(int udp_fd, const struct sockaddr_in *server, int ds_port,
+                const char *filename)
 {
-    int peer_port = 0;
     if (!valid_filename(filename)) {
-        printf("Invalid remote filename.\n");
-        return 0;
-    }
-    if (!valid_port(peer_port_text, &peer_port)) {
-        printf("Invalid peer port: expected a decimal integer from 1 to 65535.\n");
+        printf("Invalid filename.\n");
         return 0;
     }
 
-    const std::string output_name = destination == nullptr ? filename : destination;
-    std::string error;
-    if (download_peer_file(peer_ip, peer_port, filename, output_name, error) < 0) {
-        printf("Download failed: %s\n", error.c_str());
+    struct stat destination_info;
+    if (lstat(filename, &destination_info) == 0) {
+        printf("Download failed: destination already exists: %s\n", filename);
+        return 0;
+    }
+    if (errno != ENOENT) {
+        printf("Download failed: cannot inspect destination %s: %s\n",
+               filename, strerror(errno));
         return -1;
     }
-    printf("Downloaded %s to %s successfully.\n", filename, output_name.c_str());
-    return 0;
+
+    std::vector<Version> versions;
+    const VersionsResult result = fetch_versions(server, ds_port, filename, versions);
+    if (result == VersionsResult::Error)
+        return -1;
+    if (result == VersionsResult::Empty || versions.empty()) {
+        printf("No available versions for %s.\n", filename);
+        return 0;
+    }
+
+    std::vector<PeerEndpoint> locations;
+    if (find_locations(udp_fd, server, filename, versions, locations) < 0)
+        return -1;
+    if (locations.empty()) {
+        printf("No peer is currently online and publishing %s.\n", filename);
+        return 0;
+    }
+
+    std::string last_error;
+    for (const PeerEndpoint &endpoint : locations) {
+        unsigned long long received_size = 0;
+        if (download_peer_file(endpoint.ip, endpoint.port, filename, filename,
+                               &received_size, last_error) == 0) {
+            printf("Downloaded %s (%llu bytes) from UID %s at %s:%d.\n",
+                   filename, received_size, endpoint.uid.c_str(),
+                   endpoint.ip.c_str(), endpoint.port);
+            return 0;
+        }
+        if (lstat(filename, &destination_info) == 0) {
+            printf("Download failed: destination already exists: %s\n", filename);
+            return 0;
+        }
+    }
+
+    printf("Download failed from all available peers: %s\n", last_error.c_str());
+    return -1;
 }
