@@ -3,15 +3,21 @@
 #include <arpa/inet.h>
 #include <chrono>
 #include <errno.h>
+#include <exception>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 namespace {
+
+constexpr int TCP_CONTROL_TIMEOUT_MS = 30000;
+constexpr int TCP_CONNECT_TIMEOUT_MS = 10000;
+// The protocol has no version-count limit, so cap memory use defensively.
+constexpr size_t MAX_TCP_REPLY_BYTES = 1024 * 1024;
 
 using TcpDeadline = std::chrono::steady_clock::time_point;
 
@@ -26,15 +32,34 @@ int remaining_ms(const TcpDeadline &deadline)
     return static_cast<int>(remaining.count());
 }
 
-int wait_for_socket(int fd, short events, const TcpDeadline &deadline)
+int wait_for_socket(int fd, bool wait_for_read, const TcpDeadline &deadline)
 {
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    if (fd >= FD_SETSIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+
     while (true) {
         const int timeout_ms = remaining_ms(deadline);
         if (timeout_ms == 0)
             return -1;
 
-        struct pollfd descriptor = {fd, events, 0};
-        const int ready = poll(&descriptor, 1, timeout_ms);
+        fd_set descriptors;
+        FD_ZERO(&descriptors);
+        FD_SET(fd, &descriptors);
+
+        struct timeval timeout = {
+            timeout_ms / 1000,
+            (timeout_ms % 1000) * 1000
+        };
+        const int ready = select(fd + 1,
+                                 wait_for_read ? &descriptors : nullptr,
+                                 wait_for_read ? nullptr : &descriptors,
+                                 nullptr, &timeout);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready < 0)
@@ -43,11 +68,8 @@ int wait_for_socket(int fd, short events, const TcpDeadline &deadline)
             errno = ETIMEDOUT;
             return -1;
         }
-        if (descriptor.revents & POLLNVAL) {
-            errno = EBADF;
-            return -1;
-        }
-        return 0;
+        if (FD_ISSET(fd, &descriptors))
+            return 0;
     }
 }
 
@@ -76,14 +98,18 @@ int write_all_until(int fd, const char *data, size_t length,
 {
     size_t offset = 0;
     while (offset < length) {
-        if (wait_for_socket(fd, POLLOUT, deadline) < 0)
+        if (wait_for_socket(fd, false, deadline) < 0)
             return -1;
         const ssize_t written = send(fd, data + offset, length - offset,
                                      send_flags());
         if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
-        if (written <= 0)
+        if (written < 0)
             return -1;
+        if (written == 0) {
+            errno = EPIPE;
+            return -1;
+        }
         offset += static_cast<size_t>(written);
     }
     return 0;
@@ -99,13 +125,6 @@ int create_udp_socket(void)
         return -1;
     }
 
-    // Avoid leaving the interactive client stuck forever if the DS is down.
-    const struct timeval timeout = {10, 0};
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        perror("setsockopt SO_RCVTIMEO");
-        close(fd);
-        return -1;
-    }
     return fd;
 }
 
@@ -129,7 +148,8 @@ int make_server_address(struct sockaddr_in *address, const char *ds_ip, int ds_p
 int connect_tcp_with_timeout(int fd, const struct sockaddr_in *address,
                              int timeout_ms)
 {
-    if (fd < 0 || address == nullptr || timeout_ms <= 0) {
+    if (fd < 0 || address == nullptr || address->sin_family != AF_INET ||
+        timeout_ms <= 0) {
         errno = EINVAL;
         return -1;
     }
@@ -147,44 +167,28 @@ int connect_tcp_with_timeout(int fd, const struct sockaddr_in *address,
                                   sizeof(*address));
     if (connected == 0) {
         result = 0;
-    } else if (errno != EINPROGRESS) {
-        saved_error = errno;
     } else {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(timeout_ms);
-        while (true) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                saved_error = ETIMEDOUT;
-                break;
-            }
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
-            const int wait_ms = static_cast<int>(remaining.count()) + 1;
-            struct pollfd descriptor = {fd, POLLOUT, 0};
-            const int ready = poll(&descriptor, 1, wait_ms);
-            if (ready < 0 && errno == EINTR)
-                continue;
-            if (ready < 0) {
+        const int connect_error = errno;
+        if (connect_error == EINPROGRESS || connect_error == EALREADY ||
+            connect_error == EINTR) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(timeout_ms);
+            if (wait_for_socket(fd, false, deadline) < 0) {
                 saved_error = errno;
-                break;
-            }
-            if (ready == 0) {
-                saved_error = ETIMEDOUT;
-                break;
-            }
-
-            int socket_error = 0;
-            socklen_t error_length = sizeof(socket_error);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
-                           &error_length) < 0) {
-                saved_error = errno;
-            } else if (socket_error != 0) {
-                saved_error = socket_error;
             } else {
-                result = 0;
+                int socket_error = 0;
+                socklen_t error_length = sizeof(socket_error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                               &error_length) < 0) {
+                    saved_error = errno;
+                } else if (socket_error != 0) {
+                    saved_error = socket_error;
+                } else {
+                    result = 0;
+                }
             }
-            break;
+        } else {
+            saved_error = connect_error;
         }
     }
 
@@ -213,17 +217,33 @@ int set_tcp_io_timeouts(int fd, int timeout_seconds)
 }
 
 int tcp_exchange(const struct sockaddr_in *server, int port,
-                 const char *request, char *reply, size_t reply_size)
+                 const char *request, std::string &reply)
 {
-    if (server == nullptr || request == nullptr || reply == nullptr ||
-        reply_size < 2 || port < 1 || port > 65535) {
+    reply.clear();
+    if (server == nullptr || server->sin_family != AF_INET || request == nullptr ||
+        port < 1 || port > 65535) {
         fprintf(stderr, "Invalid TCP exchange parameters.\n");
         return -1;
     }
 
-    constexpr int TCP_CONTROL_DEADLINE_MS = 30000;
+    const size_t request_length = strlen(request);
+    const char *request_newline = static_cast<const char *>(
+        memchr(request, '\n', request_length));
+    if (request_length == 0 ||
+        request_newline != request + request_length - 1) {
+        fprintf(stderr, "TCP request must be a single newline-terminated message.\n");
+        return -1;
+    }
+    for (size_t i = 0; i + 1 < request_length; ++i) {
+        const unsigned char character = static_cast<unsigned char>(request[i]);
+        if (character < ' ' || character > '~') {
+            fprintf(stderr, "TCP request contains an invalid character.\n");
+            return -1;
+        }
+    }
+
     const TcpDeadline deadline = std::chrono::steady_clock::now() +
-                                 std::chrono::milliseconds(TCP_CONTROL_DEADLINE_MS);
+                                 std::chrono::milliseconds(TCP_CONTROL_TIMEOUT_MS);
 
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -234,73 +254,106 @@ int tcp_exchange(const struct sockaddr_in *server, int port,
     struct sockaddr_in target = *server;
     target.sin_port = htons(static_cast<uint16_t>(port));
     int connect_timeout_ms = remaining_ms(deadline);
-    if (connect_timeout_ms > 10000)
-        connect_timeout_ms = 10000;
-    if (prevent_sigpipe(fd) < 0 ||
-        connect_tcp_with_timeout(fd, &target, connect_timeout_ms) < 0) {
+    if (connect_timeout_ms > TCP_CONNECT_TIMEOUT_MS)
+        connect_timeout_ms = TCP_CONNECT_TIMEOUT_MS;
+    if (connect_timeout_ms <= 0) {
+        errno = ETIMEDOUT;
+        perror("connect to Directory Server");
+        close(fd);
+        return -1;
+    }
+    if (prevent_sigpipe(fd) < 0) {
+        perror("configure Directory Server TCP socket");
+        close(fd);
+        return -1;
+    }
+    if (connect_tcp_with_timeout(fd, &target, connect_timeout_ms) < 0) {
         perror("connect to Directory Server");
         close(fd);
         return -1;
     }
 
-    const int original_flags = fcntl(fd, F_GETFL, 0);
-    if (original_flags < 0 || fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {
-        perror("set non-blocking mode for Directory Server TCP socket");
-        close(fd);
-        return -1;
-    }
-
-    const size_t request_length = strlen(request);
     if (write_all_until(fd, request, request_length, deadline) < 0) {
         perror("write to Directory Server");
         close(fd);
         return -1;
     }
-    shutdown(fd, SHUT_WR);
+    if (shutdown(fd, SHUT_WR) < 0) {
+        perror("shutdown Directory Server TCP socket");
+        close(fd);
+        return -1;
+    }
 
-    size_t used = 0;
     bool terminated = false;
-    while (used < reply_size - 1) {
-        if (wait_for_socket(fd, POLLIN, deadline) < 0) {
+    char buffer[4096];
+    while (!terminated) {
+        if (wait_for_socket(fd, true, deadline) < 0) {
             perror("read from Directory Server");
             close(fd);
+            reply.clear();
             return -1;
         }
-        const ssize_t received = recv(fd, reply + used, reply_size - used - 1,
-                                      MSG_DONTWAIT);
+        const ssize_t received = recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT);
         if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
         if (received < 0) {
             perror("read from Directory Server");
             close(fd);
+            reply.clear();
             return -1;
         }
         if (received == 0)
             break;
-        if (memchr(reply + used, '\0', static_cast<size_t>(received)) != nullptr) {
-            fprintf(stderr, "Directory Server sent a non-text TCP reply.\n");
+
+        const size_t received_size = static_cast<size_t>(received);
+        if (received_size > MAX_TCP_REPLY_BYTES - reply.size()) {
+            fprintf(stderr, "Directory Server TCP reply exceeds the 1 MiB limit.\n");
             close(fd);
+            reply.clear();
             return -1;
         }
-        used += static_cast<size_t>(received);
-        if (memchr(reply, '\n', used) != nullptr) {
-            terminated = true;
-            break;
+        const char *newline = static_cast<const char *>(
+            memchr(buffer, '\n', received_size));
+        if (newline != nullptr && newline != buffer + received - 1) {
+            fprintf(stderr, "Directory Server sent data outside the TCP reply line.\n");
+            close(fd);
+            reply.clear();
+            return -1;
         }
+        for (size_t i = 0; i < received_size; ++i) {
+            const unsigned char character = static_cast<unsigned char>(buffer[i]);
+            if (character != '\n' && (character < ' ' || character > '~')) {
+                fprintf(stderr, "Directory Server sent a non-text TCP reply.\n");
+                close(fd);
+                reply.clear();
+                return -1;
+            }
+        }
+        try {
+            reply.append(buffer, received_size);
+        } catch (const std::exception &) {
+            fprintf(stderr, "Could not store Directory Server TCP reply.\n");
+            close(fd);
+            reply.clear();
+            return -1;
+        }
+        terminated = newline != nullptr;
     }
 
     close(fd);
-    reply[used] = '\0';
-    if (used == 0) {
+    if (reply.empty()) {
         fprintf(stderr, "Empty reply from Directory Server.\n");
         return -1;
     }
     if (!terminated) {
-        fprintf(stderr, "Incomplete or oversized TCP reply from Directory Server.\n");
+        fprintf(stderr, "Incomplete TCP reply from Directory Server.\n");
+        reply.clear();
         return -1;
     }
-    if (reply[used - 1] != '\n' || memchr(reply, '\n', used) != reply + used - 1) {
+    if (reply.size() < 2 || reply.back() != '\n' ||
+        reply.find('\n') != reply.size() - 1) {
         fprintf(stderr, "Directory Server sent data outside the TCP reply line.\n");
+        reply.clear();
         return -1;
     }
     return 0;

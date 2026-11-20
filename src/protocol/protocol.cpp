@@ -2,14 +2,12 @@
 
 #include <errno.h>
 #include <chrono>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sstream>
-#include <string>
+#include <random>
+#include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 
 int valid_port(const char *text, int *port)
 {
@@ -102,19 +100,35 @@ int valid_label(const char *label)
     return 1;
 }
 
+double Calculate_Random(void)
+{
+    thread_local std::mt19937_64 generator(std::random_device{}());
+    std::uniform_real_distribution<double> distribution(0.0, 1.0);
+    return distribution(generator);
+}
+
 int send_request(int fd, const struct sockaddr_in *server,
                  const char *request, char *reply, size_t reply_size)
 {
     if (fd < 0 || server == nullptr || request == nullptr || reply == nullptr ||
-        reply_size < 2) {
+        server->sin_family != AF_INET || server->sin_port == 0 ||
+        fd >= FD_SETSIZE || reply_size < 2) {
         fprintf(stderr, "Invalid UDP request parameters.\n");
         return -1;
     }
+    reply[0] = '\0';
 
     const size_t request_length = strlen(request);
-    const ssize_t sent = sendto(fd, request, request_length, 0,
-                                reinterpret_cast<const struct sockaddr *>(server),
-                                sizeof(*server));
+    if (request_length == 0) {
+        fprintf(stderr, "UDP request cannot be empty.\n");
+        return -1;
+    }
+    ssize_t sent;
+    do {
+        sent = sendto(fd, request, request_length, 0,
+                      reinterpret_cast<const struct sockaddr *>(server),
+                      sizeof(*server));
+    } while (sent < 0 && errno == EINTR);
     if (sent < 0) {
         perror("sendto");
         return -1;
@@ -127,6 +141,11 @@ int send_request(int fd, const struct sockaddr_in *server,
     constexpr int UDP_REPLY_TIMEOUT_MS = 10000;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(UDP_REPLY_TIMEOUT_MS);
+    // This holds any complete IPv4 UDP payload, so recvfrom cannot silently
+    // truncate a larger datagram before we compare it with reply_size.
+    constexpr size_t IPV4_UDP_DATAGRAM_SIZE = 65536;
+    char datagram[IPV4_UDP_DATAGRAM_SIZE];
+
     while (true) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
@@ -135,55 +154,57 @@ int send_request(int fd, const struct sockaddr_in *server,
         }
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - now);
-        struct pollfd descriptor = {fd, POLLIN, 0};
-        const int ready = poll(&descriptor, 1, static_cast<int>(remaining.count()) + 1);
+        const int timeout_ms = static_cast<int>(remaining.count()) + 1;
+        struct timeval timeout = {
+            timeout_ms / 1000,
+            (timeout_ms % 1000) * 1000
+        };
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(fd, &readable);
+        const int ready = select(fd + 1, &readable, nullptr, nullptr, &timeout);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready < 0) {
-            perror("poll for Directory Server UDP reply");
+            perror("select for Directory Server UDP reply");
             return -1;
         }
         if (ready == 0)
             continue;
-        if (descriptor.revents & (POLLERR | POLLNVAL)) {
-            fprintf(stderr, "UDP socket failed while waiting for Directory Server.\n");
-            return -1;
-        }
-        if (!(descriptor.revents & POLLIN))
+        if (!FD_ISSET(fd, &readable))
             continue;
 
-        struct sockaddr_in from;
-        struct iovec payload = {reply, reply_size - 1};
-        struct msghdr message;
-        memset(&message, 0, sizeof(message));
-        message.msg_name = &from;
-        message.msg_namelen = sizeof(from);
-        message.msg_iov = &payload;
-        message.msg_iovlen = 1;
-        const ssize_t received = recvmsg(fd, &message, MSG_DONTWAIT);
+        struct sockaddr_in from = {};
+        socklen_t from_size = sizeof(from);
+        const ssize_t received = recvfrom(
+            fd, datagram, sizeof(datagram), 0,
+            reinterpret_cast<struct sockaddr *>(&from), &from_size);
         if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
         if (received < 0) {
             perror("recvfrom");
             return -1;
         }
-        if (from.sin_family != AF_INET ||
+        if (from_size < sizeof(from) || from.sin_family != AF_INET ||
             from.sin_addr.s_addr != server->sin_addr.s_addr ||
             from.sin_port != server->sin_port)
             continue;
-        if ((message.msg_flags & MSG_TRUNC) != 0 ||
-            static_cast<size_t>(received) >= reply_size) {
+        const size_t received_size = static_cast<size_t>(received);
+        if (received_size >= reply_size) {
             fprintf(stderr, "Directory Server UDP reply is too large.\n");
             return -1;
         }
 
-        reply[received] = '\0';
-        if (received == 0 || reply[received - 1] != '\n' ||
-            memchr(reply, '\0', static_cast<size_t>(received)) != nullptr ||
-            memchr(reply, '\n', static_cast<size_t>(received)) != reply + received - 1) {
+        const char *newline = static_cast<const char *>(
+            memchr(datagram, '\n', received_size));
+        if (received_size == 0 || datagram[received_size - 1] != '\n' ||
+            memchr(datagram, '\0', received_size) != nullptr ||
+            newline != datagram + received_size - 1) {
             fprintf(stderr, "Directory Server UDP reply is not a single text line.\n");
             return -1;
         }
+        memcpy(reply, datagram, received_size);
+        reply[received_size] = '\0';
         return 0;
     }
 }

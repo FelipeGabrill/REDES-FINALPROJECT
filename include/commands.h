@@ -23,7 +23,7 @@ int command_remove(int fd, const struct sockaddr_in *server, UserState *user,
 int command_list(int fd, const struct sockaddr_in *server);
 int command_versions(const struct sockaddr_in *server, int ds_port,
                      const char *filename);
-int command_where(const struct sockaddr_in *server, int ds_port,
+int command_where(int udp_fd, const struct sockaddr_in *server, int ds_port,
                   const char *filename);
 int command_get(int udp_fd, const struct sockaddr_in *server, int ds_port,
                 const char *filename);

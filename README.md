@@ -49,9 +49,14 @@ peers in order, and saves the first successful transfer as `filename`.
 - The peer server runs independently from the command interface and handles up to
   16 concurrent incoming transfers. A `get` command can therefore run while the
   application continues serving other peer requests.
+- Outgoing DS commands are serialized by the command interface. The peer server
+  remains active on its own thread while those commands run.
 - Downloads validate the advertised size (0 to 10,000,000 bytes), handle partial
   socket reads and writes, remove incomplete files after transfer failures, and
   do not overwrite an existing destination.
+- Peer transfers use a 30-second inactivity timeout. Progress refreshes the
+  timeout; there is no fixed total-duration limit. Shutting down the application
+  interrupts active peer sockets so their worker threads can finish.
 
 ## Limits
 

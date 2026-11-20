@@ -18,6 +18,8 @@ int valid_password(const char *password);
 int valid_filename(const char *filename);
 int valid_label(const char *label);
 
+double Calculate_Random(void);
+
 int send_request(int fd, const struct sockaddr_in *server,
                  const char *request, char *reply, size_t reply_size);
 int parse_reply(const char *reply, const char *expected_prefix,

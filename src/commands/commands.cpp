@@ -5,12 +5,12 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <initializer_list>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <set>
-#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -54,7 +54,16 @@ void clear_user_session(UserState *user)
     user->logged_in = 0;
 }
 
+bool require_login(const UserState *user)
+{
+    if (user != nullptr && user->logged_in)
+        return true;
+    printf("User is not logged in.\n");
+    return false;
+}
+
 int udp_resource_request(int fd, const struct sockaddr_in *server,
+                         UserState *user,
                          const char *request, const char *prefix,
                          const char *operation,
                          std::initializer_list<const char *> allowed_statuses)
@@ -70,6 +79,9 @@ int udp_resource_request(int fd, const struct sockaddr_in *server,
                 prefix, status);
         return -1;
     }
+    if (user != nullptr &&
+        (strcmp(status, "NLG") == 0 || strcmp(status, "UNR") == 0))
+        clear_user_session(user);
     report_resource_status(operation, status);
     return 0;
 }
@@ -89,13 +101,10 @@ bool parse_file_size(const std::string &text, unsigned long long &value)
     return true;
 }
 
-bool split_protocol_line(const char *line, std::vector<std::string> &tokens)
+bool split_protocol_line(const std::string &message,
+                         std::vector<std::string> &tokens)
 {
     tokens.clear();
-    if (line == nullptr)
-        return false;
-
-    const std::string message(line);
     if (message.size() < 2 || message.back() != '\n' ||
         message.find('\n') != message.size() - 1)
         return false;
@@ -103,10 +112,11 @@ bool split_protocol_line(const char *line, std::vector<std::string> &tokens)
     const size_t content_length = message.size() - 1;
     size_t start = 0;
     for (size_t i = 0; i <= content_length; ++i) {
-        if (i < content_length &&
-            static_cast<unsigned char>(message[i]) < static_cast<unsigned char>(' ') &&
-            message[i] != '\n')
-            return false;
+        if (i < content_length) {
+            const unsigned char character = static_cast<unsigned char>(message[i]);
+            if (character < ' ' || character > '~')
+                return false;
+        }
         if (i != content_length && message[i] != ' ')
             continue;
         if (i == start)
@@ -132,9 +142,9 @@ VersionsResult fetch_versions(const struct sockaddr_in *server, int ds_port,
                               std::vector<Version> &versions)
 {
     char request[64];
-    char reply[MAX_MESSAGE];
+    std::string reply;
     snprintf(request, sizeof(request), "VRS %s\n", filename);
-    if (tcp_exchange(server, ds_port, request, reply, sizeof(reply)) < 0)
+    if (tcp_exchange(server, ds_port, request, reply) < 0)
         return VersionsResult::Error;
 
     std::vector<std::string> fields;
@@ -194,45 +204,43 @@ int query_location(int fd, const struct sockaddr_in *server,
     if (send_request(fd, server, request, reply, sizeof(reply)) < 0)
         return -1;
 
-    std::istringstream input(reply);
-    std::string prefix;
-    std::string status;
-    if (!(input >> prefix >> status) || prefix != "RWH") {
+    std::vector<std::string> fields;
+    if (!split_protocol_line(std::string(reply), fields) || fields.size() < 2 ||
+        fields[0] != "RWH") {
         fprintf(stderr, "Invalid location reply from Directory Server.\n");
         return -1;
     }
-    if (status == "NOK") {
-        std::string extra;
-        if (input >> extra) {
+    if (fields[1] == "NOK") {
+        if (fields.size() != 2) {
             fprintf(stderr, "Unexpected fields in unavailable location reply.\n");
             return -1;
         }
         return 0;
     }
-    if (status != "OK") {
-        fprintf(stderr, "Location request failed: status %s.\n", status.c_str());
+    if (fields[1] != "OK") {
+        fprintf(stderr, "Location request failed: status %s.\n",
+                fields[1].c_str());
         return -1;
     }
 
-    std::vector<PeerEndpoint> found;
-    std::string ip;
-    std::string port_text;
-    while (input >> ip) {
-        int port = 0;
+    if (fields.size() < 4 || (fields.size() - 2) % 2 != 0) {
+        fprintf(stderr, "RWH OK reply contains an incomplete peer endpoint.\n");
+        return -1;
+    }
+
+    int endpoint_count = 0;
+    for (size_t i = 2; i < fields.size(); i += 2) {
         struct in_addr address;
-        if (!(input >> port_text) || inet_pton(AF_INET, ip.c_str(), &address) != 1 ||
-            !valid_port(port_text.c_str(), &port)) {
+        int port = 0;
+        if (inet_pton(AF_INET, fields[i].c_str(), &address) != 1 ||
+            !valid_port(fields[i + 1].c_str(), &port)) {
             fprintf(stderr, "Invalid peer endpoint in Directory Server reply.\n");
             return -1;
         }
-        found.push_back({version.uid, ip, port});
+        locations.push_back({version.uid, fields[i], port});
+        ++endpoint_count;
     }
-    if (found.empty()) {
-        fprintf(stderr, "Directory Server returned RWH OK without a peer endpoint.\n");
-        return -1;
-    }
-    locations.insert(locations.end(), found.begin(), found.end());
-    return static_cast<int>(found.size());
+    return endpoint_count;
 }
 
 int find_locations(int fd, const struct sockaddr_in *server,
@@ -300,10 +308,8 @@ int command_login(int fd, const struct sockaddr_in *server,
 
 int command_logout(int fd, const struct sockaddr_in *server, UserState *user)
 {
-    if (user == nullptr || !user->logged_in) {
-        printf("User is not logged in.\n");
+    if (!require_login(user))
         return 0;
-    }
 
     char request[MAX_MESSAGE];
     char reply[MAX_MESSAGE];
@@ -326,10 +332,8 @@ int command_logout(int fd, const struct sockaddr_in *server, UserState *user)
 
 int command_unregister(int fd, const struct sockaddr_in *server, UserState *user)
 {
-    if (user == nullptr || !user->logged_in) {
-        printf("User is not logged in.\n");
+    if (!require_login(user))
         return 0;
-    }
 
     char request[MAX_MESSAGE];
     char reply[MAX_MESSAGE];
@@ -353,10 +357,8 @@ int command_unregister(int fd, const struct sockaddr_in *server, UserState *user
 int command_publish(int fd, const struct sockaddr_in *server, UserState *user,
                     const char *filename, const char *label)
 {
-    if (user == nullptr || !user->logged_in) {
-        printf("User is not logged in.\n");
+    if (!require_login(user))
         return 0;
-    }
     if (!valid_filename(filename)) {
         printf("Invalid filename: use up to 24 ASCII characters with a 3-character extension.\n");
         return 0;
@@ -366,31 +368,37 @@ int command_publish(int fd, const struct sockaddr_in *server, UserState *user,
         return 0;
     }
 
+    const int file_fd = open(filename, O_RDONLY | O_NOFOLLOW);
+    if (file_fd < 0) {
+        printf("File does not exist in the current directory: %s\n", filename);
+        return 0;
+    }
     struct stat info;
-    if (stat(filename, &info) < 0 || !S_ISREG(info.st_mode)) {
+    if (fstat(file_fd, &info) < 0 || !S_ISREG(info.st_mode)) {
+        close(file_fd);
         printf("File does not exist in the current directory: %s\n", filename);
         return 0;
     }
     if (info.st_size < 0 || info.st_size > MAX_FILE_SIZE) {
+        close(file_fd);
         printf("File size must be between 0 and 10,000,000 bytes.\n");
         return 0;
     }
+    close(file_fd);
 
     char request[MAX_MESSAGE];
     snprintf(request, sizeof(request), "PUB %s %s %s %lld %s\n",
              user->uid, user->password, filename,
              static_cast<long long>(info.st_size), label);
-    return udp_resource_request(fd, server, request, "RPB", "Publish",
+    return udp_resource_request(fd, server, user, request, "RPB", "Publish",
                                 {"OK", "NLG", "UNR", "WRP", "NOK", "ERR"});
 }
 
 int command_remove(int fd, const struct sockaddr_in *server, UserState *user,
                    const char *filename)
 {
-    if (user == nullptr || !user->logged_in) {
-        printf("User is not logged in.\n");
+    if (!require_login(user))
         return 0;
-    }
     if (!valid_filename(filename)) {
         printf("Invalid filename.\n");
         return 0;
@@ -399,7 +407,7 @@ int command_remove(int fd, const struct sockaddr_in *server, UserState *user,
     char request[MAX_MESSAGE];
     snprintf(request, sizeof(request), "REM %s %s %s\n",
              user->uid, user->password, filename);
-    return udp_resource_request(fd, server, request, "RRM", "Remove",
+    return udp_resource_request(fd, server, user, request, "RRM", "Remove",
                                 {"OK", "NLG", "UNR", "WRP", "NOK", "ERR"});
 }
 
@@ -410,7 +418,7 @@ int command_list(int fd, const struct sockaddr_in *server)
         return -1;
 
     std::vector<std::string> fields;
-    if (!split_protocol_line(reply, fields) || fields.size() < 2 ||
+    if (!split_protocol_line(std::string(reply), fields) || fields.size() < 2 ||
         fields[0] != "RLS") {
         fprintf(stderr, "Invalid resource list reply from Directory Server.\n");
         return -1;
@@ -486,7 +494,7 @@ int command_versions(const struct sockaddr_in *server, int ds_port,
     return 0;
 }
 
-int command_where(const struct sockaddr_in *server, int ds_port,
+int command_where(int udp_fd, const struct sockaddr_in *server, int ds_port,
                   const char *filename)
 {
     if (!valid_filename(filename)) {
@@ -503,12 +511,9 @@ int command_where(const struct sockaddr_in *server, int ds_port,
         return 0;
     }
 
-    const int fd = create_udp_socket();
-    if (fd < 0)
-        return -1;
     std::vector<PeerEndpoint> locations;
-    const int lookup_result = find_locations(fd, server, filename, versions, locations);
-    close(fd);
+    const int lookup_result = find_locations(udp_fd, server, filename, versions,
+                                             locations);
     if (lookup_result < 0)
         return -1;
 

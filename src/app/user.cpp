@@ -17,6 +17,24 @@ namespace {
 constexpr const char *DEFAULT_DS_IP = "193.136.138.142";
 constexpr int DEFAULT_DS_PORT = 59000;
 
+class ScopedSocket {
+public:
+    explicit ScopedSocket(int fd) : fd_(fd) {}
+    ScopedSocket(const ScopedSocket &) = delete;
+    ScopedSocket &operator=(const ScopedSocket &) = delete;
+
+    ~ScopedSocket()
+    {
+        if (fd_ >= 0)
+            close(fd_);
+    }
+
+    int get() const { return fd_; }
+
+private:
+    int fd_;
+};
+
 void usage(const char *program)
 {
     std::cerr << "Usage: " << program << " -m peerport [-n DSIP] [-p DSport]\n";
@@ -118,7 +136,8 @@ void run_user_interface(int udp_fd, const struct sockaddr_in &server,
             if (fields.size() != 2)
                 std::cout << "Usage: where filename\n";
             else
-                command_where(&server, ntohs(server.sin_port), fields[1].c_str());
+                command_where(udp_fd, &server, ntohs(server.sin_port),
+                              fields[1].c_str());
         } else if (command == "get") {
             if (fields.size() != 2)
                 std::cout << "Usage: get filename\n";
@@ -185,8 +204,8 @@ int main(int argc, char *argv[])
     if (make_server_address(&server, ds_ip, ds_port) < 0)
         return 1;
 
-    const int udp_fd = create_udp_socket();
-    if (udp_fd < 0)
+    ScopedSocket udp_socket(create_udp_socket());
+    if (udp_socket.get() < 0)
         return 1;
 
     std::signal(SIGPIPE, SIG_IGN);
@@ -194,7 +213,6 @@ int main(int argc, char *argv[])
     std::string peer_error;
     if (!peer_server.start(peer_port, peer_error)) {
         std::cerr << "Peer server startup failed: " << peer_error << '\n';
-        close(udp_fd);
         return 1;
     }
 
@@ -203,8 +221,8 @@ int main(int argc, char *argv[])
               << " (UDP and TCP)\n"
               << "Peer TCP server listening on port " << peer_port << "\n";
 
-    UserState user = {{0}, {0}, 0};
-    run_user_interface(udp_fd, server, user, peer_port);
-    close(udp_fd);
+    UserState user{};
+    run_user_interface(udp_socket.get(), server, user, peer_port);
+    peer_server.stop();
     return 0;
 }

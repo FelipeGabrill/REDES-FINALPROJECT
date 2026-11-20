@@ -2,7 +2,9 @@
 #define PEER_H
 
 #include <atomic>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,15 +22,19 @@ public:
 private:
     struct ClientWorker {
         std::thread thread;
-        std::shared_ptr<std::atomic<bool>> done;
+        std::atomic<bool> done{false};
     };
 
-    void serve();
+    void serve(int port, std::promise<std::string> startup_result);
+    void remove_active_client(int fd);
 
+    std::mutex lifecycle_mutex_;
+    std::mutex workers_mutex_;
     int listen_fd_ = -1;
     std::atomic<bool> running_{false};
-    std::thread worker_;
-    std::vector<ClientWorker> client_workers_;
+    std::thread server_thread_;
+    std::vector<std::shared_ptr<ClientWorker>> client_workers_;
+    std::vector<int> active_client_fds_;
 };
 
 int download_peer_file(const std::string &peer_ip, int peer_port,
